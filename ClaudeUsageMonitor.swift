@@ -5,6 +5,7 @@
 // Optional always-on-top floating mini-widget (toggle from the menu).
 
 import AppKit
+import CoreServices
 import Security
 import ServiceManagement
 
@@ -250,6 +251,42 @@ func fmtReset(_ date: Date?, now: Date) -> String {
 
 func fmtPercent(_ p: Double) -> String { "\(Int(p.rounded()))%" }
 
+// MARK: - Directory watcher (FSEvents — refresh the instant transcripts change)
+
+final class DirectoryWatcher {
+    private var stream: FSEventStreamRef?
+    private let onChange: () -> Void
+
+    init?(path: String, onChange: @escaping () -> Void) {
+        self.onChange = onChange
+        var context = FSEventStreamContext(version: 0,
+                                           info: Unmanaged.passUnretained(self).toOpaque(),
+                                           retain: nil, release: nil, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+            guard let info else { return }
+            Unmanaged<DirectoryWatcher>.fromOpaque(info).takeUnretainedValue().onChange()
+        }
+        // 2-second latency acts as a built-in debounce for bursts of writes.
+        guard let s = FSEventStreamCreate(nil, callback, &context,
+                                          [path] as CFArray,
+                                          FSEventStreamEventId(UInt64.max), // kFSEventStreamEventIdSinceNow
+                                          2.0,
+                                          FSEventStreamCreateFlags(kFSEventStreamCreateFlagNoDefer))
+        else { return nil }
+        stream = s
+        FSEventStreamSetDispatchQueue(s, .main)
+        FSEventStreamStart(s)
+    }
+
+    deinit {
+        if let stream {
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+        }
+    }
+}
+
 // MARK: - Floating widget
 
 final class FloatingPanel: NSPanel {
@@ -292,6 +329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var limits: [LimitWindow]?
     var lastRefresh = Date.distantPast
     var lastLimitsFetch = Date.distantPast
+    var watcher: DirectoryWatcher?
 
     var sessionLimit: LimitWindow? { limits?.first { $0.key == "five_hour" } }
     var weekLimit: LimitWindow? { limits?.first { $0.key == "seven_day" } }
@@ -306,7 +344,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refresh() }
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.refresh() }
+
+        // Refresh immediately whenever Claude Code writes a transcript line.
+        let projectsPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects").path
+        watcher = DirectoryWatcher(path: projectsPath) { [weak self] in self?.refresh() }
 
         if UserDefaults.standard.bool(forKey: "showFloatingWidget") { showPanel() }
     }
@@ -323,7 +366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func fetchLimitsIfNeeded(now: Date) {
-        guard now.timeIntervalSince(lastLimitsFetch) >= 30 else { return }
+        guard now.timeIntervalSince(lastLimitsFetch) >= 10 else { return }
         lastLimitsFetch = now
         LimitsFetcher.fetch { [weak self] windows in
             DispatchQueue.main.async {
