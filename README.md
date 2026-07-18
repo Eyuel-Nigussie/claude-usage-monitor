@@ -24,8 +24,40 @@ The widget reads the Claude Code OAuth token from your login Keychain
 (service `Claude Code-credentials`) and calls
 `https://api.anthropic.com/api/oauth/usage` — the endpoint Claude Code itself
 uses. The token never leaves your machine and is used for nothing else.
-On first run, macOS asks for Keychain access: click **Always Allow**.
-If limits show "unavailable", open Claude Code once so it refreshes the token.
+
+**Keychain prompt:** on first fetch macOS asks
+*"security wants to use your confidential information stored in
+'Claude Code-credentials'"* — click **Always Allow**. The app reads the token
+through Apple's `/usr/bin/security` tool precisely so this approval sticks:
+it is bound to Apple's signed binary, not to this app's build signature, and
+therefore survives rebuilds/updates. If you click Deny (or dismiss the
+dialog), the widget falls back to token-count mode (see below) and re-prompts
+on the next fetch cycle (~30 s).
+
+If limits stay "unavailable" with no prompt, open Claude Code once so it
+refreshes the stored token, then wait one refresh cycle.
+
+## How updating works (and its limits)
+
+- There is **no websocket / push API** for usage data. The widget polls the
+  same HTTPS endpoint that claude.ai's "Plan usage limits" panel uses.
+- Refresh triggers: an **FSEvents watcher** on `~/.claude/projects` fires
+  within ~2 s of Claude Code writing a transcript line, plus a **30 s
+  fallback poll** (for usage from other devices). Limit fetches are
+  throttled to at most one per 10 s.
+- Percentages move when a model turn **finishes** and Anthropic records its
+  usage — during a long-running turn the number jumps at the end, exactly
+  like claude.ai's own panel.
+- The endpoint reports whole integers, so the widget can read ±1% against
+  claude.ai depending on rounding and fetch timing.
+
+## Fallback mode (no limit data)
+
+When the limits endpoint is unreachable (Keychain access denied, token
+expired, offline), the widget degrades to local-only data: menu bar and
+floating widget show **session token counts** parsed from `~/.claude`
+transcripts and the estimated 5-hour block reset. Percentages return
+automatically once the endpoint is reachable again.
 
 Token figures are computed locally from `~/.claude` transcripts
 (input / output / cache read / cache write, deduped per message).

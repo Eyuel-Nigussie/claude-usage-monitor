@@ -130,7 +130,42 @@ struct LimitWindow {
 enum LimitsFetcher {
     // Reads the Claude Code OAuth access token from the login Keychain.
     // The token is used only for the local HTTPS call below and is never logged.
+    //
+    // Primary path goes through /usr/bin/security (an Apple-signed binary):
+    // its Keychain approval is stable, so one "Always Allow" survives rebuilds
+    // of this app. Direct SecItemCopyMatching is the fallback — its approval is
+    // tied to this app's code signature and resets on every rebuild.
     static func accessToken() -> String? {
+        tokenViaSecurityCLI() ?? tokenViaKeychainAPI()
+    }
+
+    private static func token(fromCredentials data: Data) -> String? {
+        guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let oauth = obj["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String
+        else { return nil }
+        return token
+    }
+
+    private static func tokenViaSecurityCLI() -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        do { try p.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0,
+              let text = String(data: data, encoding: .utf8)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty
+        else { return nil }
+        return token(fromCredentials: Data(text.utf8))
+    }
+
+    private static func tokenViaKeychainAPI() -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
@@ -139,12 +174,9 @@ enum LimitsFetcher {
         ]
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let oauth = obj["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String
+              let data = item as? Data
         else { return nil }
-        return token
+        return token(fromCredentials: data)
     }
 
     static let knownLabels: [String: String] = [
@@ -155,6 +187,11 @@ enum LimitsFetcher {
     ]
 
     static func fetch(completion: @escaping ([LimitWindow]?) -> Void) {
+        // Token retrieval may block (subprocess / Keychain prompt) — keep it off the main thread.
+        DispatchQueue.global(qos: .utility).async { fetchSync(completion: completion) }
+    }
+
+    private static func fetchSync(completion: @escaping ([LimitWindow]?) -> Void) {
         guard let token = accessToken(),
               let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else {
             completion(nil)
@@ -616,7 +653,7 @@ func printStats() {
         fetched = windows
         semaphore.signal()
     }
-    _ = semaphore.wait(timeout: .now() + 20)
+    _ = semaphore.wait(timeout: .now() + 60)
     if let fetched {
         for w in fetched {
             print("limit \(w.label): \(fmtPercent(w.utilization))  \(fmtReset(w.resetsAt, now: now))")
