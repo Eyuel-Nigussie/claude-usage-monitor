@@ -565,7 +565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func buildPanel() {
-        let size = NSSize(width: 210, height: 72)
+        let size = NSSize(width: 250, height: 72)
         let p = FloatingPanel(contentRect: NSRect(origin: .zero, size: size),
                               styleMask: [.borderless, .nonactivatingPanel],
                               backing: .buffered, defer: false)
@@ -616,13 +616,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let v = screen.visibleFrame
             p.setFrameOrigin(NSPoint(x: v.maxX - size.width - 16, y: v.maxY - size.height - 12))
         }
+        p.setContentSize(size) // restored frames may carry an older size
     }
 
     func updatePanel(now: Date) {
         guard let panel, panel.isVisible else { return }
 
         if let session = sessionLimit {
-            panelCostLabel?.stringValue = "✳ \(fmtPercent(session.utilization)) session"
+            var title = "✳ \(fmtPercent(session.utilization)) session"
+            if let resets = session.resetsAt {
+                title += " · \(fmtRemaining(resets.timeIntervalSince(now)))"
+            }
+            panelCostLabel?.stringValue = title
             panelBar?.fraction = CGFloat(session.utilization / 100)
             if let week = weekLimit {
                 panelSubLabel?.stringValue = "week \(fmtPercent(week.utilization)) · \(fmtReset(week.resetsAt, now: now))"
