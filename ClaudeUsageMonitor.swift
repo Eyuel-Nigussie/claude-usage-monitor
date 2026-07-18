@@ -427,9 +427,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func fetchLimitsIfNeeded(now: Date) {
-        // Polite cadence: at most once per minute — the usage endpoint rate-limits
-        // aggressive polling (429), which is worse than being a minute stale.
-        guard now.timeIntervalSince(lastLimitsFetch) >= 60 else { return }
+        // Polite cadence: the usage endpoint tolerates only occasional requests —
+        // even 1/min has triggered 429s. 5-minute staleness is fine for a gauge.
+        guard now.timeIntervalSince(lastLimitsFetch) >= 300 else { return }
         lastLimitsFetch = now
         LimitsFetcher.fetch { [weak self] windows in
             DispatchQueue.main.async {
@@ -437,8 +437,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if windows != nil {
                     self.limits = windows
                 } else {
-                    // Failed (rate limit, offline, token) — back off for 5 minutes.
-                    self.lastLimitsFetch = Date().addingTimeInterval(240)
+                    // Failed (rate limit, offline, token) — back off ~10 minutes total.
+                    self.lastLimitsFetch = Date().addingTimeInterval(300)
                 }
                 let now = Date()
                 self.updateStatusTitle(now: now)

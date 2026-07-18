@@ -59,12 +59,14 @@ authenticated with your local Claude Code OAuth token. Call schedule:
 | Trigger | Network call? | Frequency |
 |---|---|---|
 | Transcript change (FSEvents) | No — local re-parse only | ~2 s after Claude Code writes |
-| Fallback timer | Yes — limits fetch | At most **1 request / 60 s** |
-| Opening the dropdown menu | Yes (same 60 s throttle) | — |
+| Fallback timer | Yes — limits fetch | At most **1 request / 5 min** |
+| Opening the dropdown menu | Yes (same 5 min throttle) | — |
 | `--stats` CLI run | Yes — one request per run | Manual |
 
-After any failed fetch (429, offline, bad token) the widget **backs off for
-5 minutes** before trying again.
+After any failed fetch (429, offline, bad token) the widget backs off to
+roughly **one attempt per 10 minutes**. The endpoint has proven sensitive
+even to 1 request/minute, hence the conservative cadence — limit percentages
+may lag claude.ai by up to ~5 minutes by design.
 
 ## Rate limiting (429) — what it is and what to do
 
