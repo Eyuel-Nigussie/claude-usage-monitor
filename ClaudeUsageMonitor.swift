@@ -135,6 +135,8 @@ enum LimitsFetcher {
     // its Keychain approval is stable, so one "Always Allow" survives rebuilds
     // of this app. Direct SecItemCopyMatching is the fallback — its approval is
     // tied to this app's code signature and resets on every rebuild.
+    static var debugLog: [String] = []
+
     static func accessToken() -> String? {
         tokenViaSecurityCLI() ?? tokenViaKeychainAPI()
     }
@@ -153,16 +155,28 @@ enum LimitsFetcher {
         p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
         let out = Pipe()
         p.standardOutput = out
-        p.standardError = Pipe()
-        do { try p.run() } catch { return nil }
+        let err = Pipe()
+        p.standardError = err
+        do { try p.run() } catch {
+            debugLog.append("cli: spawn failed: \(error.localizedDescription)")
+            return nil
+        }
         let data = out.fileHandleForReading.readDataToEndOfFile()
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         guard p.terminationStatus == 0,
               let text = String(data: data, encoding: .utf8)?
                   .trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty
-        else { return nil }
-        return token(fromCredentials: Data(text.utf8))
+        else {
+            let msg = String(data: errData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            debugLog.append("cli: exit \(p.terminationStatus) \(msg)")
+            return nil
+        }
+        let token = token(fromCredentials: Data(text.utf8))
+        debugLog.append(token == nil ? "cli: got payload but no accessToken key" : "cli: token ok")
+        return token
     }
 
     private static func tokenViaKeychainAPI() -> String? {
@@ -173,10 +187,14 @@ enum LimitsFetcher {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data
-        else { return nil }
-        return token(fromCredentials: data)
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess, let data = item as? Data else {
+            debugLog.append("api: SecItemCopyMatching status \(status)")
+            return nil
+        }
+        let token = token(fromCredentials: data)
+        debugLog.append(token == nil ? "api: got payload but no accessToken key" : "api: token ok")
+        return token
     }
 
     static let knownLabels: [String: String] = [
@@ -192,8 +210,10 @@ enum LimitsFetcher {
     }
 
     private static func fetchSync(completion: @escaping ([LimitWindow]?) -> Void) {
+        if debugLog.count > 40 { debugLog.removeFirst(debugLog.count - 40) }
         guard let token = accessToken(),
               let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else {
+            debugLog.append("fetch: no token available")
             completion(nil)
             return
         }
@@ -205,10 +225,14 @@ enum LimitsFetcher {
         URLSession.shared.dataTask(with: req) { data, response, _ in
             var windows: [LimitWindow]?
             defer { completion(windows) }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             guard let data,
-                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  status == 200,
                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-            else { return }
+            else {
+                debugLog.append("fetch: http \(status), body: \(data.flatMap { String(data: $0.prefix(200), encoding: .utf8) } ?? "none")")
+                return
+            }
 
             var found: [LimitWindow] = []
             for (key, value) in obj {
@@ -403,12 +427,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func fetchLimitsIfNeeded(now: Date) {
-        guard now.timeIntervalSince(lastLimitsFetch) >= 10 else { return }
+        // Polite cadence: at most once per minute — the usage endpoint rate-limits
+        // aggressive polling (429), which is worse than being a minute stale.
+        guard now.timeIntervalSince(lastLimitsFetch) >= 60 else { return }
         lastLimitsFetch = now
         LimitsFetcher.fetch { [weak self] windows in
             DispatchQueue.main.async {
                 guard let self else { return }
-                if windows != nil { self.limits = windows }
+                if windows != nil {
+                    self.limits = windows
+                } else {
+                    // Failed (rate limit, offline, token) — back off for 5 minutes.
+                    self.lastLimitsFetch = Date().addingTimeInterval(240)
+                }
                 let now = Date()
                 self.updateStatusTitle(now: now)
                 self.updatePanel(now: now)
@@ -661,6 +692,7 @@ func printStats() {
     } else {
         print("limits: unavailable (no Keychain access or token expired)")
     }
+    for line in LimitsFetcher.debugLog { print("debug: \(line)") }
 }
 
 // MARK: - Main

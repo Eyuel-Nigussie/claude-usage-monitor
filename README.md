@@ -51,13 +51,61 @@ refreshes the stored token, then wait one refresh cycle.
 - The endpoint reports whole integers, so the widget can read ±1% against
   claude.ai depending on rounding and fetch timing.
 
+## How the widget calls the API
+
+Exactly one endpoint is used: `GET https://api.anthropic.com/api/oauth/usage`,
+authenticated with your local Claude Code OAuth token. Call schedule:
+
+| Trigger | Network call? | Frequency |
+|---|---|---|
+| Transcript change (FSEvents) | No — local re-parse only | ~2 s after Claude Code writes |
+| Fallback timer | Yes — limits fetch | At most **1 request / 60 s** |
+| Opening the dropdown menu | Yes (same 60 s throttle) | — |
+| `--stats` CLI run | Yes — one request per run | Manual |
+
+After any failed fetch (429, offline, bad token) the widget **backs off for
+5 minutes** before trying again.
+
+## Rate limiting (429) — what it is and what to do
+
+**How it occurs:** the usage endpoint is unofficial and tolerates only
+low-frequency polling. Polling it aggressively (an early build of this widget
+fetched every ~10 s during active Claude sessions) makes Anthropic's server
+return `429 rate_limit_error` for this token+endpoint combination. Normal
+operation at the current 60 s cadence should never trigger it; running many
+copies of the app, hammering `--stats` in a loop, or other tools polling the
+same endpoint can.
+
+**What happens to the widget:** every limit fetch fails, so it degrades to
+**fallback mode** — menu bar and floating widget show locally-parsed session
+token counts (`✳ 25.7M tok`) and the estimated 5-hour block reset instead of
+the official percentages. Claude Code itself and claude.ai are unaffected
+(the block applies to this endpoint, not your plan).
+
+**How long until it resets:** Anthropic doesn't publish the window and the
+response carries no `retry-after`. Empirically it can persist from several
+minutes up to roughly an hour after sustained over-polling. There is nothing
+to clear manually — it expires server-side.
+
+**What you should do:** nothing. Leave the app running; it retries every
+1–5 minutes and the percentages reappear automatically the moment the server
+stops returning 429. Do not rebuild/relaunch repeatedly (each launch adds a
+request) and avoid running `--stats` in a loop. To check the current state:
+
+```sh
+"/Applications/Claude Usage Monitor.app/Contents/MacOS/ClaudeUsageMonitor" --stats
+```
+
+The `debug:` lines show the exact failure (`fetch: http 429 ...` while
+blocked; `limit Session (5h): ...` once recovered).
+
 ## Fallback mode (no limit data)
 
-When the limits endpoint is unreachable (Keychain access denied, token
-expired, offline), the widget degrades to local-only data: menu bar and
-floating widget show **session token counts** parsed from `~/.claude`
-transcripts and the estimated 5-hour block reset. Percentages return
-automatically once the endpoint is reachable again.
+When the limits endpoint is unreachable (rate-limited, Keychain access
+denied, token expired, offline), the widget degrades to local-only data:
+menu bar and floating widget show **session token counts** parsed from
+`~/.claude` transcripts and the estimated 5-hour block reset. Percentages
+return automatically once the endpoint is reachable again.
 
 Token figures are computed locally from `~/.claude` transcripts
 (input / output / cache read / cache write, deduped per message).
