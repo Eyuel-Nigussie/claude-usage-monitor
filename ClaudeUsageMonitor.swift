@@ -1,19 +1,12 @@
 // Claude Usage Monitor — minimal macOS menu bar widget
-// Parses ~/.claude/projects/**/*.jsonl locally (no network) and shows:
-//   • current 5-hour session block cost + time remaining
-//   • today's total tokens and estimated cost, per model
+// Mirrors claude.ai's "Usage" panel: Session (5hr) and Weekly (7 day)
+// utilization with reset times, fetched from the Claude Code OAuth endpoint.
 // Optional always-on-top floating mini-widget (toggle from the menu).
+// Local transcript parsing survives only in the --stats diagnostic CLI.
 
 import AppKit
-import CoreServices
 import Security
 import ServiceManagement
-
-func prettyModel(_ model: String) -> String {
-    var s = model.replacingOccurrences(of: "claude-", with: "")
-    s = s.replacingOccurrences(of: "-", with: " ")
-    return s.capitalized
-}
 
 // MARK: - Usage entries
 
@@ -198,10 +191,10 @@ enum LimitsFetcher {
     }
 
     static let knownLabels: [String: String] = [
-        "five_hour": "Session (5h)",
-        "seven_day": "Week",
-        "seven_day_sonnet": "Week · Sonnet",
-        "seven_day_opus": "Week · Opus",
+        "five_hour": "Session (5hr)",
+        "seven_day": "Weekly (7 day)",
+        "seven_day_sonnet": "Weekly · Sonnet",
+        "seven_day_opus": "Weekly · Opus",
     ]
 
     static func fetch(completion: @escaping ([LimitWindow]?) -> Void) {
@@ -312,40 +305,16 @@ func fmtReset(_ date: Date?, now: Date) -> String {
 
 func fmtPercent(_ p: Double) -> String { "\(Int(p.rounded()))%" }
 
-// MARK: - Directory watcher (FSEvents — refresh the instant transcripts change)
-
-final class DirectoryWatcher {
-    private var stream: FSEventStreamRef?
-    private let onChange: () -> Void
-
-    init?(path: String, onChange: @escaping () -> Void) {
-        self.onChange = onChange
-        var context = FSEventStreamContext(version: 0,
-                                           info: Unmanaged.passUnretained(self).toOpaque(),
-                                           retain: nil, release: nil, copyDescription: nil)
-        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
-            guard let info else { return }
-            Unmanaged<DirectoryWatcher>.fromOpaque(info).takeUnretainedValue().onChange()
-        }
-        // 2-second latency acts as a built-in debounce for bursts of writes.
-        guard let s = FSEventStreamCreate(nil, callback, &context,
-                                          [path] as CFArray,
-                                          FSEventStreamEventId(UInt64.max), // kFSEventStreamEventIdSinceNow
-                                          2.0,
-                                          FSEventStreamCreateFlags(kFSEventStreamCreateFlagNoDefer))
-        else { return nil }
-        stream = s
-        FSEventStreamSetDispatchQueue(s, .main)
-        FSEventStreamStart(s)
+// Matches claude.ai's usage panel phrasing: "Resets in 2h".
+func fmtResetIn(_ date: Date?, now: Date) -> String {
+    guard let date else { return "" }
+    let s = max(0, Int(date.timeIntervalSince(now)))
+    if s >= 24 * 3600 {
+        let d = s / 86400, h = (s % 86400) / 3600
+        return h > 0 ? "Resets in \(d)d \(h)h" : "Resets in \(d)d"
     }
-
-    deinit {
-        if let stream {
-            FSEventStreamStop(stream)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-        }
-    }
+    if s >= 3600 { return "Resets in \(s / 3600)h" }
+    return "Resets in \(max(1, s / 60))m"
 }
 
 // MARK: - Floating widget
@@ -381,16 +350,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var timer: Timer?
 
     var panel: FloatingPanel?
-    var panelCostLabel: NSTextField?
-    var panelSubLabel: NSTextField?
+    var panelSessionPct: NSTextField?
+    var panelSessionSub: NSTextField?
+    var panelWeekPct: NSTextField?
+    var panelWeekSub: NSTextField?
     var panelBar: BarView?
     var panelWeekBar: BarView?
 
-    var entries: [UsageEntry] = []
     var limits: [LimitWindow]?
-    var lastRefresh = Date.distantPast
     var lastLimitsFetch = Date.distantPast
-    var watcher: DirectoryWatcher?
 
     var sessionLimit: LimitWindow? { limits?.first { $0.key == "five_hour" } }
     var weekLimit: LimitWindow? { limits?.first { $0.key == "seven_day" } }
@@ -405,12 +373,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         refresh()
+        // 30 s tick keeps the countdowns fresh; the network fetch inside is
+        // throttled separately (5 min).
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.refresh() }
-
-        // Refresh immediately whenever Claude Code writes a transcript line.
-        let projectsPath = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/projects").path
-        watcher = DirectoryWatcher(path: projectsPath) { [weak self] in self?.refresh() }
 
         if UserDefaults.standard.bool(forKey: "showFloatingWidget") { showPanel() }
     }
@@ -419,8 +384,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func refresh() {
         let now = Date()
-        entries = UsageScanner.loadEntries(since: now.addingTimeInterval(-24 * 3600))
-        lastRefresh = now
         updateStatusTitle(now: now)
         updatePanel(now: now)
         fetchLimitsIfNeeded(now: now)
@@ -447,11 +410,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func todayEntries(now: Date) -> [UsageEntry] {
-        let startOfDay = Calendar.current.startOfDay(for: now)
-        return entries.filter { $0.date >= startOfDay }
-    }
-
     // MARK: Status bar
 
     func updateStatusTitle(now: Date) {
@@ -462,10 +420,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 title += "  wk \(fmtPercent(week.utilization))"
             }
             button.title = title
-        } else if let block = activeBlock(in: entries, now: now) {
-            button.title = "✳ \(fmtTokens(Totals(block.entries).tokens))"
         } else {
-            button.title = "✳ idle"
+            button.title = "✳ …"
         }
     }
 
@@ -476,41 +432,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         let now = Date()
 
+        menu.addItem(header("Usage"))
         if let limits {
-            menu.addItem(header("Plan limits"))
             for w in limits {
-                menu.addItem(info("\(w.label):  \(fmtPercent(w.utilization))   ·   \(fmtReset(w.resetsAt, now: now))"))
+                menu.addItem(info("\(w.label):  \(fmtPercent(w.utilization))   ·   \(fmtResetIn(w.resetsAt, now: now))"))
             }
         } else {
-            menu.addItem(header("Plan limits"))
-            menu.addItem(info("Unavailable — run Claude Code once, then allow"))
-            menu.addItem(info("Keychain access when prompted"))
+            menu.addItem(info("Waiting for data — allow Keychain access"))
+            menu.addItem(info("if prompted; retries every few minutes"))
         }
-        menu.addItem(.separator())
-
-        if let block = activeBlock(in: entries, now: now) {
-            let t = Totals(block.entries)
-            menu.addItem(header("Session — resets in \(fmtRemaining(block.end.timeIntervalSince(now)))"))
-            menu.addItem(info("\(fmtTokens(t.tokens)) tokens"))
-            menu.addItem(info("in \(fmtTokens(t.input))  ·  out \(fmtTokens(t.output))  ·  cache \(fmtTokens(t.cacheRead + t.cacheWrite))"))
-        } else {
-            menu.addItem(header("Session"))
-            menu.addItem(info("No active session"))
-        }
-
-        menu.addItem(.separator())
-        let today = todayEntries(now: now)
-        let tt = Totals(today)
-        menu.addItem(header("Today"))
-        menu.addItem(info("\(fmtTokens(tt.tokens)) tokens"))
-
-        var byModel: [String: [UsageEntry]] = [:]
-        for e in today { byModel[e.model, default: []].append(e) }
-        for (model, es) in byModel.sorted(by: { Totals($0.value).tokens > Totals($1.value).tokens }) {
-            let mt = Totals(es)
-            menu.addItem(info("\(prettyModel(model)):  \(fmtTokens(mt.tokens))"))
-        }
-
         menu.addItem(.separator())
 
         let floating = NSMenuItem(title: "Floating Widget", action: #selector(toggleFloating), keyEquivalent: "f")
@@ -565,7 +495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func buildPanel() {
-        let size = NSSize(width: 250, height: 72)
+        let size = NSSize(width: 230, height: 128)
         let p = FloatingPanel(contentRect: NSRect(origin: .zero, size: size),
                               styleMask: [.borderless, .nonactivatingPanel],
                               backing: .buffered, defer: false)
@@ -586,29 +516,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         effect.layer?.masksToBounds = true
         p.contentView = effect
 
-        let cost = NSTextField(labelWithString: "…")
-        cost.font = NSFont.monospacedDigitSystemFont(ofSize: 15, weight: .semibold)
-        cost.frame = NSRect(x: 14, y: 47, width: size.width - 28, height: 20)
-        effect.addSubview(cost)
+        let headerLabel = NSTextField(labelWithString: "USAGE")
+        headerLabel.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        headerLabel.textColor = .secondaryLabelColor
+        headerLabel.frame = NSRect(x: 14, y: 106, width: size.width - 28, height: 14)
+        effect.addSubview(headerLabel)
 
-        let bar = BarView(frame: NSRect(x: 14, y: 39, width: size.width - 28, height: 4))
-        bar.colorByLevel = true
-        effect.addSubview(bar)
+        func nameLabel(_ text: String, y: CGFloat) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            l.font = NSFont.systemFont(ofSize: 13, weight: .regular)
+            l.frame = NSRect(x: 14, y: y, width: 150, height: 17)
+            effect.addSubview(l)
+            return l
+        }
+        func pctLabel(y: CGFloat) -> NSTextField {
+            let l = NSTextField(labelWithString: "–")
+            l.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+            l.alignment = .right
+            l.frame = NSRect(x: size.width - 74, y: y, width: 60, height: 17)
+            effect.addSubview(l)
+            return l
+        }
+        func subLabel(y: CGFloat) -> NSTextField {
+            let l = NSTextField(labelWithString: "")
+            l.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+            l.textColor = .secondaryLabelColor
+            l.frame = NSRect(x: 14, y: y, width: size.width - 28, height: 14)
+            effect.addSubview(l)
+            return l
+        }
+        func barView(y: CGFloat) -> BarView {
+            let b = BarView(frame: NSRect(x: 14, y: y, width: size.width - 28, height: 4))
+            b.colorByLevel = true
+            effect.addSubview(b)
+            return b
+        }
 
-        let sub = NSTextField(labelWithString: "")
-        sub.font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
-        sub.textColor = .secondaryLabelColor
-        sub.frame = NSRect(x: 14, y: 20, width: size.width - 28, height: 14)
-        effect.addSubview(sub)
+        _ = nameLabel("Session (5hr)", y: 84)
+        panelSessionPct = pctLabel(y: 84)
+        panelBar = barView(y: 77)
+        panelSessionSub = subLabel(y: 60)
 
-        let weekBar = BarView(frame: NSRect(x: 14, y: 12, width: size.width - 28, height: 4))
-        weekBar.colorByLevel = true
-        effect.addSubview(weekBar)
+        _ = nameLabel("Weekly (7 day)", y: 38)
+        panelWeekPct = pctLabel(y: 38)
+        panelWeekBar = barView(y: 31)
+        panelWeekSub = subLabel(y: 14)
 
-        panelCostLabel = cost
-        panelSubLabel = sub
-        panelBar = bar
-        panelWeekBar = weekBar
         panel = p
 
         p.setFrameAutosaveName("ClaudeUsageFloatingWidget")
@@ -623,31 +576,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let panel, panel.isVisible else { return }
 
         if let session = sessionLimit {
-            var title = "✳ \(fmtPercent(session.utilization)) session"
-            if let resets = session.resetsAt {
-                title += " · \(fmtRemaining(resets.timeIntervalSince(now)))"
-            }
-            panelCostLabel?.stringValue = title
+            panelSessionPct?.stringValue = fmtPercent(session.utilization)
             panelBar?.fraction = CGFloat(session.utilization / 100)
-            if let week = weekLimit {
-                panelSubLabel?.stringValue = "week \(fmtPercent(week.utilization)) · \(fmtReset(week.resetsAt, now: now))"
-                panelWeekBar?.fraction = CGFloat(week.utilization / 100)
-            } else {
-                panelSubLabel?.stringValue = fmtReset(session.resetsAt, now: now)
-                panelWeekBar?.fraction = 0
-            }
-        } else if let block = activeBlock(in: entries, now: now) {
-            let t = Totals(block.entries)
-            panelCostLabel?.stringValue = "✳ \(fmtTokens(t.tokens)) tok"
-            panelSubLabel?.stringValue = "resets \(fmtRemaining(block.end.timeIntervalSince(now)))"
-            panelBar?.fraction = CGFloat(now.timeIntervalSince(block.start) / (5 * 3600))
-            panelWeekBar?.fraction = 0
+            panelSessionSub?.stringValue = fmtResetIn(session.resetsAt, now: now)
         } else {
-            panelCostLabel?.stringValue = "✳ idle"
-            let tt = Totals(todayEntries(now: now))
-            panelSubLabel?.stringValue = "today \(fmtTokens(tt.tokens)) tok"
+            panelSessionPct?.stringValue = "–"
             panelBar?.fraction = 0
+            panelSessionSub?.stringValue = "waiting for data"
+        }
+        if let week = weekLimit {
+            panelWeekPct?.stringValue = fmtPercent(week.utilization)
+            panelWeekBar?.fraction = CGFloat(week.utilization / 100)
+            panelWeekSub?.stringValue = fmtResetIn(week.resetsAt, now: now)
+        } else {
+            panelWeekPct?.stringValue = "–"
             panelWeekBar?.fraction = 0
+            panelWeekSub?.stringValue = ""
         }
     }
 
