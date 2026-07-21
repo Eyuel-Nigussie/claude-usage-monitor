@@ -36,8 +36,8 @@ therefore survives rebuilds/updates. If you click Deny (or dismiss the
 dialog), the widget shows "waiting for data" and re-prompts on the next
 fetch cycle (a few minutes).
 
-If limits stay "unavailable" with no prompt, open Claude Code once so it
-refreshes the stored token, then wait one refresh cycle.
+If the widget stays on "waiting for data" with no prompt, open Claude Code
+once so it refreshes the stored token, then wait one refresh cycle.
 
 ## How updating works (and its limits)
 
@@ -99,7 +99,7 @@ request) and avoid running `--stats` in a loop. To check the current state:
 ```
 
 The `debug:` lines show the exact failure (`fetch: http 429 ...` while
-blocked; `limit Session (5h): ...` once recovered).
+blocked; `limit Session (5hr): ...` once recovered).
 
 ## When no data is available
 
