@@ -36,8 +36,13 @@ therefore survives rebuilds/updates. If you click Deny (or dismiss the
 dialog), the widget shows "waiting for data" and re-prompts on the next
 fetch cycle (a few minutes).
 
+If the Keychain item doesn't exist (some Claude Code versions/setups store
+credentials in `~/.claude/.credentials.json` instead), no prompt appears and
+the widget reads that file directly — no approval needed.
+
 If the widget stays on "waiting for data" with no prompt, open Claude Code
-once so it refreshes the stored token, then wait one refresh cycle.
+once so it refreshes the stored token, then wait one refresh cycle — or run
+the `--stats` diagnostic below to see the exact failure.
 
 ## How updating works (and its limits)
 

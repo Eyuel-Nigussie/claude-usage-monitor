@@ -131,7 +131,21 @@ enum LimitsFetcher {
     static var debugLog: [String] = []
 
     static func accessToken() -> String? {
-        tokenViaSecurityCLI() ?? tokenViaKeychainAPI()
+        tokenViaSecurityCLI() ?? tokenViaKeychainAPI() ?? tokenViaCredentialsFile()
+    }
+
+    // Some Claude Code versions/setups store credentials in a plain file
+    // instead of the Keychain.
+    private static func tokenViaCredentialsFile() -> String? {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/.credentials.json")
+        guard let data = try? Data(contentsOf: url) else {
+            debugLog.append("file: no ~/.claude/.credentials.json")
+            return nil
+        }
+        let token = token(fromCredentials: data)
+        debugLog.append(token == nil ? "file: got payload but no accessToken key" : "file: token ok")
+        return token
     }
 
     private static func token(fromCredentials data: Data) -> String? {
